@@ -1,0 +1,37 @@
+--- a/mvm/mvm.h
++++ b/mvm/mvm.h
+@@ -1436,13 +1436,12 @@
+ 				   IWL_UCODE_TLV_CAPA_LAR_SUPPORT);
+ 
+ 	/*
+-	 * Enable LAR only if it is supported by the FW (TLV) &&
+-	 * enabled in the NVM
++	 * PATCH(local): force LAR off so the wiphy is not self-managed and
++	 * follows the standard cfg80211 regulatory domain (permits 5 GHz AP).
+ 	 */
+-	if (mvm->trans->cfg->nvm_type == IWL_NVM_EXT)
+-		return nvm_lar && tlv_lar;
+-	else
+-		return tlv_lar;
++	(void)nvm_lar;
++	(void)tlv_lar;
++	return false;
+ }
+ 
+ static inline bool iwl_mvm_is_wifi_mcc_supported(struct iwl_mvm *mvm)
+--- a/mvm/mac80211.c
++++ b/mvm/mac80211.c
+@@ -542,12 +542,8 @@
+ 				      NL80211_EXT_FEATURE_EXT_KEY_ID);
+ 	hw->wiphy->features |= NL80211_FEATURE_HT_IBSS;
+ 
++	/* PATCH(local): leave wiphy unmanaged so standard regdb + hints apply */
+ 	hw->wiphy->regulatory_flags |= REGULATORY_ENABLE_RELAX_NO_IR;
+-	if (iwl_mvm_is_lar_supported(mvm))
+-		hw->wiphy->regulatory_flags |= REGULATORY_WIPHY_SELF_MANAGED;
+-	else
+-		hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG |
+-					       REGULATORY_DISABLE_BEACON_HINTS;
+ 
+ 	if (mvm->trans->mac_cfg->device_family >= IWL_DEVICE_FAMILY_AX210)
+ 		wiphy_ext_feature_set(hw->wiphy,

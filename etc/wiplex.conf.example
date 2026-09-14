@@ -1,0 +1,50 @@
+# wiplex configuration
+# Apply changes with:  sudo systemctl reload wiplex
+# (or: sudo systemctl restart wiplex)
+#
+# NOTE: changing WIFI_IF or AP_IF requires a full restart, not a reload.
+
+# --- interfaces --------------------------------------------------------------
+# WiFi radio shared between the uplink client and the access point.
+# Leave empty to auto-detect the WiFi interface that carries the default route.
+WIFI_IF=""
+
+# AP interface name (<= 15 chars). Leave empty to derive "<WIFI_IF>ap".
+AP_IF=""
+
+# NAT egress interface. Leave empty to auto-detect the default-route interface.
+UPSTREAM_IF=""
+
+# --- access point ------------------------------------------------------------
+SSID="wiplex"
+PSK="ChangeMe_12345"      # empty string = open network (not recommended)
+
+# Regulatory country (ISO alpha-2). Empty = leave the current setting alone.
+COUNTRY=""
+
+# Fixed band/channel, used only when there is no WiFi client link to follow
+# (e.g. the uplink is Ethernet). AP_BAND is "5" or "2".
+AP_BAND="5"
+AP_CHANNEL="36"
+
+# --- routed subnet -----------------------------------------------------------
+AP_IP="192.168.50.1"
+AP_CIDR="192.168.50.1/24"
+AP_NET="192.168.50.0/24"
+DHCP_START="192.168.50.100"
+DHCP_END="192.168.50.200"
+DHCP_MASK="255.255.255.0"
+DHCP_LEASE="12h"
+
+# --- DNS ---------------------------------------------------------------------
+# "dnsmasq"  : wiplex runs a DNS forwarder on AP_IP (self-contained).
+# "external" : DHCP only; clients are told to use DNS_IP (something else on
+#              the machine already serves :53, e.g. systemd-resolved/unbound/
+#              a proxy). Set DNS_IP to that resolver's address.
+DNS_MODE="dnsmasq"
+DNS_IP=""                 # empty = AP_IP
+DNS_PORT="53"             # dnsmasq DNS port (dnsmasq mode only)
+
+# Seconds to wait for the WiFi client link before falling back to a fixed
+# channel (only relevant when the uplink is the WiFi client itself).
+WAIT_FOR_UPLINK_SECS="90"

@@ -1,0 +1,15 @@
+# build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+
+# runtime / logs
+*.log
+*.leases
+
+# editor / OS
+*~
+.DS_Store
