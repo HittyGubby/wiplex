@@ -30,6 +30,11 @@ A single WiFi card can run STA and AP at the same time on most modern drivers,
 
 - If the uplink is the WiFi client, the AP is pinned to the client's channel.
   When the client roams, wiplex restarts hostapd on the new channel.
+- A concurrent AP **cannot** run on a **DFS channel** (radar detection) on many
+  drivers — starting one fails CAC or crashes the firmware. While the client is
+  on a DFS channel wiplex keeps the AP down and logs a warning; pin the uplink
+  to a non-DFS BSSID (e.g. NetworkManager `802-11-wireless.bssid`) to keep the
+  AP up.
 - A 5 GHz AP is often blocked by regulatory rules (`NO-IR`) on Intel cards using
   LAR. See **[kernel/README.md](kernel/README.md)** for the optional fix.
 
@@ -157,6 +162,18 @@ interface (`ip route show default`).
 Run `sudo /usr/local/bin/wiplex` in the foreground to see the error, and check
 `tools/diagnose.sh`.
 
+**AP stops working after the client roams / after suspend.**
+Several possible cases:
+- *DFS channel.* If the client lands on a DFS channel the AP cannot run
+  concurrently. wiplex will log `STA on DFS channel N; AP kept down` and will
+  not restart-loop. Pin the uplink to a non-DFS BSSID, e.g.:
+  `nmcli connection modify "<conn>" 802-11-wireless.bssid <non-DFS BSSID>`.
+  Non-DFS 5 GHz channels are 36–48 and 149–165 (region dependent).
+- *Suspend/resume.* The radio is re-initialised on resume. wiplex installs a
+  sleep hook (`/usr/lib/systemd/system-sleep/wiplex`) that stops the service on
+  suspend and starts it again on resume. If the radio is still unhappy, reload
+  the driver: `modprobe -r iwlmvm iwlwifi && modprobe iwlwifi iwlmvm`.
+
 ---
 
 ## Optional kernel tweak (Intel + LAR)
@@ -184,7 +201,7 @@ sudo ./kernel/restore-iwlwifi.sh # only if you applied the kernel tweak
 wiplex/
 ├── bin/wiplex                       # the manager (installed to /usr/local/bin/wiplex)
 ├── etc/wiplex.conf.example          # config template (installed to /etc/wiplex.conf)
-├── systemd/wiplex.service           # systemd unit
+├── systemd/                          # unit + suspend/resume sleep hook
 ├── kernel/                          # optional Intel iwlwifi LAR patch + build/restore
 ├── tools/diagnose.sh                # read-only capability/regulatory checks
 ├── install.sh

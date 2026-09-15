@@ -109,6 +109,13 @@ resolve_defaults() {
 sta_freq() { iw dev "$WIFI_IF" link 2>/dev/null | awk '/freq:/{print int($2)}'; }
 chan_of_freq() { local f=$1; if [ "$f" -ge 5000 ]; then echo $(( (f - 5000) / 5 )); else echo $(( (f - 2407) / 5 )); fi; }
 hwmode_of_freq() { local f=$1; if [ "$f" -ge 5000 ]; then echo a; else echo g; fi; }
+is_dfs_channel() {
+    local ch=$1 phy
+    phy=$(iw dev "$WIFI_IF" info 2>/dev/null | awk '/wiphy/{print "phy"$2}')
+    [ -n "$phy" ] || return 1
+    iw phy "$phy" info 2>/dev/null | grep -E "\[${ch}\]" | grep -q "radar detection"
+}
+LAST_DFS_CH=""
 
 # ---- AP interface -----------------------------------------------------------
 ensure_ap_if() {
@@ -251,6 +258,25 @@ while true; do
         ch="$AP_CHANNEL"
         mode=$([ "$AP_BAND" = "5" ] && echo a || echo g)
     fi
+
+    # A single radio cannot run a concurrent AP on a DFS channel (the firmware
+    # rejects the CAC / vif binding). Keep the AP down and warn instead of
+    # entering a restart loop.
+    if [ -n "$f" ] && [ "$f" -gt 0 ] && is_dfs_channel "$ch"; then
+        if [ -n "$HAPD_PID" ] && kill -0 "$HAPD_PID" 2>/dev/null; then
+            kill "$HAPD_PID" 2>/dev/null
+            wait "$HAPD_PID" 2>/dev/null
+        fi
+        HAPD_PID=""
+        CHANNEL=""
+        if [ "$LAST_DFS_CH" != "$ch" ]; then
+            log "STA on DFS channel $ch; AP kept down. Pin the uplink to a non-DFS BSSID (802-11-wireless.bssid) or use a non-DFS network."
+            LAST_DFS_CH=$ch
+        fi
+        sleep 3
+        continue
+    fi
+    LAST_DFS_CH=""
 
     if [ -z "$HAPD_PID" ] || ! kill -0 "$HAPD_PID" 2>/dev/null || [ "$ch" != "$CHANNEL" ]; then
         if [ -n "$HAPD_PID" ]; then

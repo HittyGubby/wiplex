@@ -38,6 +38,7 @@ install -Dm755 "$SRC/bin/wiplex" "$PREFIX/bin/wiplex"
 
 echo "==> Installing systemd unit"
 install -Dm644 "$SRC/systemd/wiplex.service" "$UNIT_DST"
+install -Dm755 "$SRC/systemd/wiplex-sleep" /usr/lib/systemd/system-sleep/wiplex
 
 if [ -f "$CONF_DST" ]; then
     echo "==> Keeping existing $CONF_DST"

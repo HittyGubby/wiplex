@@ -17,6 +17,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 rm -f "$UNIT_DST"
+rm -f /usr/lib/systemd/system-sleep/wiplex
 rm -f "$PREFIX/bin/wiplex"
 rm -f /etc/sysctl.d/90-wiplex.conf
 

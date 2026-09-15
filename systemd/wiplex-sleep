@@ -1,0 +1,7 @@
+#!/bin/sh
+# Restart wiplex cleanly across suspend/hibernate.
+# Installed to /usr/lib/systemd/system-sleep/wiplex
+case "$1" in
+  pre)  systemctl stop wiplex.service ;;
+  post) systemctl start wiplex.service ;;
+esac
