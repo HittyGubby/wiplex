@@ -1,29 +1,34 @@
 #!/bin/bash
 #
-# wiplex - share one WiFi radio between a client (STA) link and an access
-#          point (AP). The AP lives on its own routed subnet and NATs out the
-#          upstream interface. Config: /etc/wiplex.conf
+# wiplex - share the internet as a routed, NATed hotspot from one WiFi radio.
 #
-# A single radio cannot run STA and AP on different channels, so when the
-# upstream is the WiFi client itself the AP is pinned to the client's channel
-# and restarted whenever the client roams.
+# Hybrid uplink:
+#   * wired default route present -> use it and free the WiFi radio
+#     (STA disconnected, AP on a fixed non-DFS channel)
+#   * otherwise                   -> share the WiFi client radio (AP follows
+#     the client's channel; DFS channels are avoided conservatively)
 #
+# SAFETY: the AP interface is always removed *before* the STA is (dis)connected.
+# On some Intel firmware, disconnecting the STA while an AP vif exists crashes
+# the firmware and can knock the card off the PCIe bus.
+#
+# Config: /etc/wiplex.conf   (reload with: systemctl reload wiplex)
 # SPDX-License-Identifier: MIT
 set -u
 
 CONF="${WIPLEX_CONF:-/etc/wiplex.conf}"
 
 # ---- defaults (override in $CONF) -------------------------------------------
-WIFI_IF=""              # WiFi radio used for the AP (and uplink); empty = autodetect
-AP_IF=""                # AP interface name; empty = "<WIFI_IF>ap"
-UPSTREAM_IF=""          # NAT egress interface; empty = default-route interface
+WIFI_IF=""              # WiFi radio (AP + client); empty = auto-detect
+AP_IF=""                # AP interface; empty = "<WIFI_IF>ap"
+ETH_IF=""               # wired uplink; empty = auto-detect default-route iface
 
 SSID="wiplex"
 PSK=""                  # empty -> open network (not recommended)
 
 COUNTRY=""              # regulatory country, e.g. US/GB/DE; empty = leave as-is
-AP_BAND="5"             # fixed band, used only when there is no STA link to follow
-AP_CHANNEL="36"         # fixed channel, same case
+AP_BAND="5"             # fixed band for wired mode ("5" or "2")
+AP_CHANNEL="36"         # fixed NON-DFS channel for wired mode
 
 AP_IP="192.168.50.1"
 AP_CIDR="192.168.50.1/24"
@@ -37,7 +42,11 @@ DNS_MODE="dnsmasq"      # "dnsmasq" (serve DNS on AP_IP) or "external"
 DNS_IP=""               # clients' DNS in external mode; empty = AP_IP
 DNS_PORT="53"           # dnsmasq DNS port (dnsmasq mode)
 
-WAIT_FOR_UPLINK_SECS=90 # how long to wait for the STA link before using a fixed channel
+AVOID_DFS="yes"         # in WiFi-share mode, avoid DFS channels
+DFS_COOLDOWN="90"       # seconds between DFS-avoidance attempts
+FREE_RADIO_ON_WIRED="yes"  # disconnect the client while on wired uplink
+STUCK_TIMEOUT="45"      # clear a stuck BSSID pin after this many seconds
+UPLINK_CONN=""          # NM connection name/uuid; empty = auto-detect
 NFT_TABLE="wiplex"
 
 # shellcheck disable=SC1090
@@ -45,15 +54,15 @@ NFT_TABLE="wiplex"
 
 DNSMASQ_CONF="/run/wiplex-dnsmasq.conf"
 HOSTAPD_CONF="/run/wiplex-hostapd.conf"
-DNSMASQ_LOG="/run/wiplex-dnsmasq.log"
-HOSTAPD_LOG="/run/wiplex-hostapd.log"
-DNSMASQ_LEASE="/run/wiplex-dnsmasq.leases"
 
 HAPD_PID=""
 DNSMASQ_PID=""
 CHANNEL=""
 RELOAD=0
 _CLEANED=0
+MODE=""
+UPSTREAM_IF=""
+DISCONNECT_SINCE=""
 
 log() { echo "[wiplex] $*"; }
 die() { echo "[wiplex] ERROR: $*" >&2; exit 1; }
@@ -62,7 +71,7 @@ cleanup() {
     [ "$_CLEANED" = 1 ] && return
     _CLEANED=1
     log "cleaning up"
-    [ -n "$HAPD_PID" ] && kill "$HAPD_PID" 2>/dev/null
+    stop_hostapd
     [ -n "$DNSMASQ_PID" ] && kill "$DNSMASQ_PID" 2>/dev/null
     nft delete table ip "$NFT_TABLE" 2>/dev/null
     ip addr flush dev "$AP_IF" 2>/dev/null
@@ -87,13 +96,22 @@ detect_wifi_if() {
     done
 }
 
-detect_upstream_if() {
-    ip route show default 2>/dev/null | awk '{print $5; exit}'
+wired_uplink() {
+    local d
+    if [ -n "${ETH_IF:-}" ]; then
+        if [ -d "/sys/class/net/$ETH_IF" ] \
+           && [ "$(cat "/sys/class/net/$ETH_IF/carrier" 2>/dev/null)" = 1 ] \
+           && ip -4 addr show dev "$ETH_IF" 2>/dev/null | grep -q "inet "; then
+            printf '%s' "$ETH_IF"
+        fi
+        return
+    fi
+    d=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    if [ -n "$d" ] && [ ! -d "/sys/class/net/$d/wireless" ]; then printf '%s' "$d"; fi
 }
 
 resolve_defaults() {
-    [ -n "$WIFI_IF" ]     || WIFI_IF=$(detect_wifi_if)
-    [ -n "$UPSTREAM_IF" ] || UPSTREAM_IF=$(detect_upstream_if)
+    [ -n "$WIFI_IF" ] || WIFI_IF=$(detect_wifi_if)
     if [ -z "$AP_IF" ]; then
         if [ -n "$WIFI_IF" ] && [ "$(( ${#WIFI_IF} + 2 ))" -le 15 ]; then
             AP_IF="${WIFI_IF}ap"
@@ -101,12 +119,12 @@ resolve_defaults() {
             AP_IF="wiplex-ap"
         fi
     fi
-    [ -n "$AP_IF" ] || die "no AP interface (set AP_IF in $CONF)"
     [ -n "$DNS_IP" ] || DNS_IP="$AP_IP"
 }
 
-# ---- channel helpers --------------------------------------------------------
+# ---- helpers ----------------------------------------------------------------
 sta_freq() { iw dev "$WIFI_IF" link 2>/dev/null | awk '/freq:/{print int($2)}'; }
+sta_ssid() { iw dev "$WIFI_IF" link 2>/dev/null | awk -F': ' '/SSID:/{print $2; exit}'; }
 chan_of_freq() { local f=$1; if [ "$f" -ge 5000 ]; then echo $(( (f - 5000) / 5 )); else echo $(( (f - 2407) / 5 )); fi; }
 hwmode_of_freq() { local f=$1; if [ "$f" -ge 5000 ]; then echo a; else echo g; fi; }
 is_dfs_channel() {
@@ -115,9 +133,87 @@ is_dfs_channel() {
     [ -n "$phy" ] || return 1
     iw phy "$phy" info 2>/dev/null | grep -E "\[${ch}\]" | grep -q "radar detection"
 }
-LAST_DFS_CH=""
 
-# ---- AP interface -----------------------------------------------------------
+UPLINK_UUID_FILE="/run/wiplex-uplink.uuid"
+uplink_uuid() {
+    local u
+    if [ -n "${UPLINK_CONN:-}" ]; then
+        u=$(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: -v n="$UPLINK_CONN" '$2==n{print $1; exit}')
+        if [ -n "$u" ]; then printf '%s\n' "$u" > "$UPLINK_UUID_FILE"; printf '%s' "$u"; return; fi
+    fi
+    u=$(nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$WIFI_IF" '$2==d{print $1; exit}')
+    if [ -n "$u" ]; then printf '%s\n' "$u" > "$UPLINK_UUID_FILE"; printf '%s' "$u"; return; fi
+    [ -r "$UPLINK_UUID_FILE" ] && cat "$UPLINK_UUID_FILE"
+}
+
+wifi_ssid_candidates() {
+    nmcli -m multiline -f BSSID,SSID,CHAN,SIGNAL device wifi list 2>/dev/null | awk -v ssid="$1" '
+    function val(l) { sub(/^[^:]*:[[:space:]]*/, "", l); return l }
+    /^BSSID:/  { if (h && s == ssid && c ~ /^[0-9]+$/) print b, c, g;
+                 h = 1; b = val($0); s = ""; c = ""; g = ""; next }
+    /^SSID:/   { s = val($0); next }
+    /^CHAN:/   { c = val($0); next }
+    /^SIGNAL:/ { g = val($0); next }
+    END        { if (h && s == ssid && c ~ /^[0-9]+$/) print b, c, g }
+    '
+}
+
+best_non_dfs_bssid() {
+    local ssid="$1" b ch sig best="" bestsig=-999
+    while read -r b ch sig; do
+        [ -n "$b" ] || continue
+        case "$sig" in ''|*[!0-9-]*) continue ;; esac
+        is_dfs_channel "$ch" && continue
+        if [ "$sig" -gt "$bestsig" ]; then bestsig=$sig; best=$b; fi
+    done < <(wifi_ssid_candidates "$ssid")
+    [ -n "$best" ] && printf '%s %s' "$best" "$bestsig"
+}
+
+# Conservative DFS avoidance: only when the STA is on a DFS channel, with a
+# cooldown, pinning the profile to the best non-DFS BSSID (the only method that
+# reliably moves NetworkManager). Never signal-based -> no BSSID flipping.
+LAST_DFS_TRY=0
+avoid_dfs_once() {
+    [ "${AVOID_DFS:-yes}" = "yes" ] || return 0
+    command -v nmcli >/dev/null 2>&1 || return 0
+    local f ch now ssid uuid info best
+    f=$(sta_freq); [ -n "$f" ] || return 0
+    ch=$(chan_of_freq "$f")
+    is_dfs_channel "$ch" || return 0
+    now=$(date +%s)
+    [ $(( now - LAST_DFS_TRY )) -lt "${DFS_COOLDOWN:-90}" ] && return 0
+    LAST_DFS_TRY=$now
+    ssid=$(sta_ssid); uuid=$(uplink_uuid)
+    [ -n "$ssid" ] && [ -n "$uuid" ] || return 0
+    nmcli device wifi rescan >/dev/null 2>&1
+    sleep 3
+    info=$(best_non_dfs_bssid "$ssid")
+    best=${info%% *}
+    if [ -z "$best" ]; then log "DFS ch$ch: no non-DFS alternative found"; return 0; fi
+    log "DFS ch$ch: pinning to non-DFS $best"
+    nmcli connection modify uuid "$uuid" 802-11-wireless.bssid "$best" >/dev/null 2>&1
+    nmcli connection up uuid "$uuid" >/dev/null 2>&1
+}
+
+handle_stuck_pin() {
+    if [ -z "$(sta_freq)" ]; then
+        DISCONNECT_SINCE=${DISCONNECT_SINCE:-$(date +%s)}
+        if [ $(( $(date +%s) - DISCONNECT_SINCE )) -gt "${STUCK_TIMEOUT:-45}" ]; then
+            DISCONNECT_SINCE=$(date +%s)
+            local u
+            u=$(uplink_uuid)
+            if [ -n "$u" ] && [ -n "$(nmcli -g 802-11-wireless.bssid connection show "$u" 2>/dev/null)" ]; then
+                log "uplink stuck; clearing BSSID pin and retrying"
+                nmcli connection modify uuid "$u" 802-11-wireless.bssid "" >/dev/null 2>&1
+                nmcli connection up uuid "$u" >/dev/null 2>&1
+            fi
+        fi
+    else
+        DISCONNECT_SINCE=""
+    fi
+}
+
+# ---- AP / DHCP / NAT --------------------------------------------------------
 ensure_ap_if() {
     if ! ip link show "$AP_IF" >/dev/null 2>&1; then
         iw dev "$WIFI_IF" interface add "$AP_IF" type __ap || return 1
@@ -130,19 +226,18 @@ ensure_ap_if() {
     return 0
 }
 
-# ---- dnsmasq (DHCP, optionally DNS) -----------------------------------------
 write_dnsmasq_conf() {
     {
         echo "interface=$AP_IF"
+        echo "bind-dynamic"
         echo "dhcp-range=$DHCP_START,$DHCP_END,$DHCP_MASK,$DHCP_LEASE"
-        echo "dhcp-leasefile=$DNSMASQ_LEASE"
+        echo "dhcp-leasefile=/run/wiplex-dnsmasq.leases"
         echo "dhcp-option=3,$AP_IP"
         if [ "$DNS_MODE" = "external" ]; then
             echo "port=0"
             echo "dhcp-option=6,$DNS_IP"
         else
             echo "listen-address=$AP_IP"
-            echo "bind-interfaces"
             echo "port=$DNS_PORT"
             echo "no-resolv"
             echo "dhcp-option=6,$AP_IP"
@@ -154,33 +249,29 @@ write_dnsmasq_conf() {
 
 start_dnsmasq() {
     write_dnsmasq_conf
-    dnsmasq -k --conf-file="$DNSMASQ_CONF" >>"$DNSMASQ_LOG" 2>&1 &
+    dnsmasq -k --conf-file="$DNSMASQ_CONF" >>/run/wiplex-dnsmasq.log 2>&1 &
     DNSMASQ_PID=$!
     log "dnsmasq started (pid $DNSMASQ_PID, dns=$DNS_MODE)"
 }
-
 restart_dnsmasq() {
-    if [ -n "$DNSMASQ_PID" ]; then
-        kill "$DNSMASQ_PID" 2>/dev/null
-        wait "$DNSMASQ_PID" 2>/dev/null
-    fi
+    [ -n "$DNSMASQ_PID" ] && kill "$DNSMASQ_PID" 2>/dev/null && wait "$DNSMASQ_PID" 2>/dev/null
     DNSMASQ_PID=""
     start_dnsmasq
 }
 
-# ---- NAT --------------------------------------------------------------------
 setup_nat() {
+    local up="$1"
     nft delete table ip "$NFT_TABLE" 2>/dev/null
     nft add table ip "$NFT_TABLE"
     nft add chain ip "$NFT_TABLE" postrouting \
         '{ type nat hook postrouting priority srcnat; policy accept; }'
-    nft add rule ip "$NFT_TABLE" postrouting ip saddr "$AP_NET" \
-        oifname "$UPSTREAM_IF" masquerade
+    if [ -n "$up" ]; then
+        nft add rule ip "$NFT_TABLE" postrouting ip saddr "$AP_NET" oifname "$up" masquerade
+    fi
     sysctl -qw net.ipv4.ip_forward=1
-    log "NAT: $AP_NET -> $UPSTREAM_IF"
+    log "NAT: $AP_NET -> ${up:-none}"
 }
 
-# ---- hostapd ----------------------------------------------------------------
 start_hostapd() {
     local ch=$1 mode=$2
     {
@@ -196,19 +287,11 @@ start_hostapd() {
         echo "wpa_key_mgmt=WPA-PSK"
         echo "rsn_pairwise=CCMP"
     } > "$HOSTAPD_CONF"
-    hostapd "$HOSTAPD_CONF" >>"$HOSTAPD_LOG" 2>&1 &
+    hostapd "$HOSTAPD_CONF" >>/run/wiplex-hostapd.log 2>&1 &
     HAPD_PID=$!
     log "hostapd started on channel $ch (hw_mode=$mode, pid $HAPD_PID)"
 }
-
-# ---- reload -----------------------------------------------------------------
-reload_all() {
-    log "reloading config"
-    resolve_defaults
-    ip addr flush dev "$AP_IF" 2>/dev/null
-    ensure_ap_if
-    setup_nat
-    restart_dnsmasq
+stop_hostapd() {
     if [ -n "$HAPD_PID" ]; then
         kill "$HAPD_PID" 2>/dev/null
         wait "$HAPD_PID" 2>/dev/null
@@ -216,27 +299,41 @@ reload_all() {
     HAPD_PID=""
     CHANNEL=""
 }
+ap_delete() {
+    stop_hostapd
+    ip addr flush dev "$AP_IF" 2>/dev/null
+    iw dev "$AP_IF" del 2>/dev/null
+}
+ensure_hostapd() {
+    local ch=$1 mode=$2
+    if [ -z "$HAPD_PID" ] || ! kill -0 "$HAPD_PID" 2>/dev/null || [ "$ch" != "$CHANNEL" ]; then
+        stop_hostapd
+        CHANNEL=$ch
+        start_hostapd "$ch" "$mode"
+    fi
+}
+
+set_mode() {
+    local newmode="$1" newup="$2"
+    [ "$newmode" = "$MODE" ] && [ "$newup" = "$UPSTREAM_IF" ] && return
+    log "uplink mode: $newmode (${newup:-none})"
+    MODE=$newmode
+    UPSTREAM_IF=$newup
+    DISCONNECT_SINCE=""
+    ap_delete   # never touch the STA while an AP vif exists
+    if [ "$newmode" = "wired" ]; then
+        [ "${FREE_RADIO_ON_WIRED:-yes}" = "yes" ] && nmcli device disconnect "$WIFI_IF" >/dev/null 2>&1
+    else
+        nmcli device connect "$WIFI_IF" >/dev/null 2>&1
+    fi
+    setup_nat "$UPSTREAM_IF"
+}
 
 # ---- main -------------------------------------------------------------------
 resolve_defaults
 [ -n "$WIFI_IF" ] || die "no WiFi interface found; set WIFI_IF in $CONF"
-[ -n "$UPSTREAM_IF" ] || die "no upstream interface; set UPSTREAM_IF in $CONF"
-log "wifi=$WIFI_IF ap=$AP_IF upstream=$UPSTREAM_IF"
-
 [ -n "$COUNTRY" ] && { iw reg set "$COUNTRY" 2>/dev/null || true; }
 
-# If the uplink is the WiFi client, wait for it so the AP can share its channel.
-if [ "$UPSTREAM_IF" = "$WIFI_IF" ]; then
-    log "waiting up to ${WAIT_FOR_UPLINK_SECS}s for STA link on $WIFI_IF..."
-    n=0
-    while [ "$n" -lt "$WAIT_FOR_UPLINK_SECS" ]; do
-        [ -n "$(sta_freq)" ] && break
-        sleep 2; n=$(( n + 2 ))
-    done
-fi
-
-ensure_ap_if || die "could not create AP interface $AP_IF"
-setup_nat
 start_dnsmasq
 
 while true; do
@@ -244,47 +341,34 @@ while true; do
         RELOAD=0
         # shellcheck disable=SC1090
         . "$CONF" 2>/dev/null || true
-        reload_all
+        resolve_defaults
+        ap_delete
+        setup_nat "$UPSTREAM_IF"
+        restart_dnsmasq
         continue
     fi
 
-    ensure_ap_if >/dev/null 2>&1
-
-    f=$(sta_freq)
-    if [ -n "$f" ] && [ "$f" -gt 0 ]; then
-        ch=$(chan_of_freq "$f")
-        mode=$(hwmode_of_freq "$f")
+    eth=$(wired_uplink)
+    if [ -n "$eth" ]; then
+        set_mode wired "$eth"
+        ensure_ap_if >/dev/null 2>&1
+        ensure_hostapd "$AP_CHANNEL" "$([ "$AP_BAND" = "5" ] && echo a || echo g)"
     else
-        ch="$AP_CHANNEL"
-        mode=$([ "$AP_BAND" = "5" ] && echo a || echo g)
-    fi
-
-    # A single radio cannot run a concurrent AP on a DFS channel (the firmware
-    # rejects the CAC / vif binding). Keep the AP down and warn instead of
-    # entering a restart loop.
-    if [ -n "$f" ] && [ "$f" -gt 0 ] && is_dfs_channel "$ch"; then
-        if [ -n "$HAPD_PID" ] && kill -0 "$HAPD_PID" 2>/dev/null; then
-            kill "$HAPD_PID" 2>/dev/null
-            wait "$HAPD_PID" 2>/dev/null
+        set_mode duplex "$WIFI_IF"
+        handle_stuck_pin
+        f=$(sta_freq)
+        if [ -n "$f" ] && [ "$f" -gt 0 ]; then
+            ch=$(chan_of_freq "$f")
+            if is_dfs_channel "$ch"; then
+                ap_delete
+                avoid_dfs_once
+            else
+                ensure_ap_if >/dev/null 2>&1
+                ensure_hostapd "$ch" "$(hwmode_of_freq "$f")"
+            fi
+        else
+            ap_delete   # no uplink: keep the radio free for the client
         fi
-        HAPD_PID=""
-        CHANNEL=""
-        if [ "$LAST_DFS_CH" != "$ch" ]; then
-            log "STA on DFS channel $ch; AP kept down. Pin the uplink to a non-DFS BSSID (802-11-wireless.bssid) or use a non-DFS network."
-            LAST_DFS_CH=$ch
-        fi
-        sleep 3
-        continue
-    fi
-    LAST_DFS_CH=""
-
-    if [ -z "$HAPD_PID" ] || ! kill -0 "$HAPD_PID" 2>/dev/null || [ "$ch" != "$CHANNEL" ]; then
-        if [ -n "$HAPD_PID" ]; then
-            kill "$HAPD_PID" 2>/dev/null
-            wait "$HAPD_PID" 2>/dev/null
-        fi
-        CHANNEL=$ch
-        start_hostapd "$ch" "$mode"
     fi
     sleep 3
 done

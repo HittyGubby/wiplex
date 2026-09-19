@@ -1,19 +1,17 @@
 # wiplex configuration
 # Apply changes with:  sudo systemctl reload wiplex
-# (or: sudo systemctl restart wiplex)
-#
-# NOTE: changing WIFI_IF or AP_IF requires a full restart, not a reload.
+# (changing WIFI_IF/ETH_IF/AP_IF needs a restart, not a reload)
 
 # --- interfaces --------------------------------------------------------------
-# WiFi radio shared between the uplink client and the access point.
-# Leave empty to auto-detect the WiFi interface that carries the default route.
+# WiFi radio shared between the client uplink and the access point.
+# Empty = auto-detect the WiFi interface on the default route.
 WIFI_IF=""
 
-# AP interface name (<= 15 chars). Leave empty to derive "<WIFI_IF>ap".
+# AP interface name (<= 15 chars). Empty = derive "<WIFI_IF>ap".
 AP_IF=""
 
-# NAT egress interface. Leave empty to auto-detect the default-route interface.
-UPSTREAM_IF=""
+# Wired uplink. Empty = auto-detect (a wired interface carrying the default route).
+ETH_IF=""
 
 # --- access point ------------------------------------------------------------
 SSID="wiplex"
@@ -22,8 +20,8 @@ PSK="ChangeMe_12345"      # empty string = open network (not recommended)
 # Regulatory country (ISO alpha-2). Empty = leave the current setting alone.
 COUNTRY=""
 
-# Fixed band/channel, used only when there is no WiFi client link to follow
-# (e.g. the uplink is Ethernet). AP_BAND is "5" or "2".
+# Fixed band/channel for WIRED mode. Must be a non-DFS channel
+# (5 GHz non-DFS are 36-48 and 149-165).
 AP_BAND="5"
 AP_CHANNEL="36"
 
@@ -38,13 +36,21 @@ DHCP_LEASE="12h"
 
 # --- DNS ---------------------------------------------------------------------
 # "dnsmasq"  : wiplex runs a DNS forwarder on AP_IP (self-contained).
-# "external" : DHCP only; clients are told to use DNS_IP (something else on
-#              the machine already serves :53, e.g. systemd-resolved/unbound/
-#              a proxy). Set DNS_IP to that resolver's address.
+# "external" : DHCP only; clients use DNS_IP (something else already serves
+#              :53, e.g. systemd-resolved/unbound/a proxy).
 DNS_MODE="dnsmasq"
 DNS_IP=""                 # empty = AP_IP
 DNS_PORT="53"             # dnsmasq DNS port (dnsmasq mode only)
 
-# Seconds to wait for the WiFi client link before falling back to a fixed
-# channel (only relevant when the uplink is the WiFi client itself).
-WAIT_FOR_UPLINK_SECS="90"
+# --- WiFi-share (duplex) behaviour -------------------------------------------
+AVOID_DFS="yes"           # avoid DFS uplink channels automatically
+DFS_COOLDOWN="90"         # seconds between DFS-avoidance attempts
+STUCK_TIMEOUT="45"        # clear a stuck BSSID pin after this many seconds
+
+# --- wired behaviour ---------------------------------------------------------
+# Disconnect the WiFi client while on the wired uplink, so the AP can use a
+# fixed channel instead of sharing the client's channel.
+FREE_RADIO_ON_WIRED="yes"
+
+# Optional: fix a specific NetworkManager connection for the uplink.
+UPLINK_CONN=""
