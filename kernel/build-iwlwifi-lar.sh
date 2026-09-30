@@ -8,6 +8,7 @@
 #
 # Overrides:
 #   SRC_VER=x.y.z   force the kernel.org source version (default: autodetect)
+#   SRC_URL=<url>   explicit source tarball URL (any of .tar.xz/.tar.gz)
 #   JOBS=n          build parallelism (default: nproc)
 #
 # SPDX-License-Identifier: MIT
@@ -31,21 +32,46 @@ VER="${SRC_VER:-$(echo "$KREL" | grep -oE '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)
 [ -n "$VER" ] || { echo "ERROR: cannot determine source version from '$KREL'" >&2; exit 1; }
 MAJ="${VER%%.*}"
 
-if [ "${VER#*-rc}" != "$VER" ]; then
+# Candidate source URLs (first that downloads wins). SRC_URL overrides all.
+URLS=()
+if [ -n "${SRC_URL:-}" ]; then
+    URLS+=("$SRC_URL")
+elif [ "${VER#*-rc}" != "$VER" ]; then
+    # Mainline RC: cdn.kernel.org has no testing/ tree, so use the git tag
+    # archive. GitHub first (reliable); kernel.org tarball service as fallback.
     VER="${VER/\.0-rc/-rc}"
-    URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJ}.x/testing/linux-${VER}.tar.xz"
+    URLS+=("https://github.com/torvalds/linux/archive/refs/tags/v${VER}.tar.gz")
+    URLS+=("https://git.kernel.org/torvalds/t/linux-${VER}.tar.gz")
 else
     case "$VER" in *.[0-9]0) VER="${VER%.0}" ;; esac
-    URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJ}.x/linux-${VER}.tar.xz"
+    URLS+=("https://cdn.kernel.org/pub/linux/kernel/v${MAJ}.x/linux-${VER}.tar.xz")
 fi
-TARBALL="$(basename "$URL")"
 
 echo "Kernel : $KVER"
-echo "Source : $TARBALL"
-echo "URL    : $URL"
+echo "Source : linux-${VER}"
 
 mkdir -p "$CACHE"
-[ -s "$CACHE/$TARBALL" ] || { echo "Downloading..."; curl -L --fail -o "$CACHE/$TARBALL" "$URL"; }
+TARBALL=""
+for u in "${URLS[@]}"; do
+    TARBALL="$(basename "$u")"
+    if [ -s "$CACHE/$TARBALL" ]; then
+        echo "Using cached $TARBALL"
+        break
+    fi
+    echo "Downloading $u"
+    if curl -L --fail --speed-limit 2048 --speed-time 30 \
+            -o "$CACHE/$TARBALL" "$u"; then
+        break
+    fi
+    echo "  mirror failed, trying next"
+    rm -f "$CACHE/$TARBALL"
+    TARBALL=""
+done
+if [ -z "$TARBALL" ] || [ ! -s "$CACHE/$TARBALL" ]; then
+    echo "ERROR: could not download kernel source for $VER." >&2
+    echo "Set SRC_URL=<tarball-url> to use a specific source." >&2
+    exit 1
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -53,7 +79,12 @@ trap 'rm -rf "$WORK"' EXIT
 echo "Extracting driver sources"
 tar -xf "$CACHE/$TARBALL" -C "$WORK"
 SRC="$WORK/linux-${VER}/drivers/net/wireless/intel/iwlwifi"
-[ -d "$SRC" ] || { echo "ERROR: driver source not found at $SRC" >&2; exit 1; }
+if [ ! -d "$SRC" ]; then
+    SRC="$(find "$WORK" -maxdepth 6 -type d \
+        -path '*/drivers/net/wireless/intel/iwlwifi' 2>/dev/null | head -1)"
+fi
+[ -n "$SRC" ] && [ -d "$SRC" ] || {
+    echo "ERROR: driver source not found under $WORK" >&2; exit 1; }
 
 echo "Applying patch"
 if ! patch -p1 -d "$SRC" --fuzz=3 < "$PATCH"; then
