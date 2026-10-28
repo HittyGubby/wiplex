@@ -70,5 +70,19 @@ echo "If something already owns *:53, set DNS_MODE=external in /etc/wiplex.conf.
 hr; echo "IP forwarding"; hr
 sysctl -n net.ipv4.ip_forward 2>/dev/null
 
+hr; echo "IPv6 (wiplex)"; hr
+(
+    [ -r /etc/wiplex.conf ] && . /etc/wiplex.conf
+    NFT_TABLE=${NFT_TABLE:-wiplex}
+    echo "IPV6_MODE=${IPV6_MODE:-off}"
+    echo "AP_IP6=${AP_IP6:-<unset>}  AP_PREFIX6=${AP_PREFIX6:-<unset>}"
+    echo "net.ipv6.conf.all.forwarding=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)"
+    if [ -n "${AP_IF:-}" ]; then
+        ip -6 addr show dev "$AP_IF" 2>/dev/null | sed -n 's/^ *inet6 /  /p'
+        nft list table ip6 "$NFT_TABLE" 2>/dev/null || true
+        nft list table inet "$NFT_TABLE" 2>/dev/null || true
+    fi
+)
+
 hr; echo "Current STA link"; hr
 [ -n "${WIFI_IF:-}" ] && iw dev "$WIFI_IF" link 2>/dev/null || true

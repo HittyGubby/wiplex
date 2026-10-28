@@ -94,6 +94,10 @@ sudo systemctl restart wiplex    # full reset (needed if you change interfaces)
 | `AP_IP` / `AP_CIDR` / `AP_NET` | `192.168.50.1` … | Gateway address and subnet. |
 | `DHCP_START` / `DHCP_END` | `.100` / `.200` | DHCP pool. |
 | `DHCP_MASK` / `DHCP_LEASE` | `255.255.255.0` / `12h` | DHCP mask and lease time. |
+| `IPV6_MODE` | `off` | `off`, `nat66`, or `routed` — see [IPv6 for AP clients](#ipv6-for-ap-clients). |
+| `AP_IP6` | first address in prefix | IPv6 gateway address on the AP. |
+| `AP_PREFIX6` | – | `/64` advertised to clients (required for `nat66`/`routed`). |
+| `DNS_IP6` | `AP_IP6` | IPv6 DNS handed to clients. |
 | `DNS_MODE` | `dnsmasq` | `dnsmasq` = serve DNS on `AP_IP`; `external` = DHCP only. |
 | `DNS_IP` | `AP_IP` | DNS handed to clients in `external` mode. |
 | `DNS_PORT` | `53` | dnsmasq DNS port (`dnsmasq` mode). |
@@ -124,6 +128,48 @@ changing the client, which is required for stability on some Intel firmware.
   proxy, ...). wiplex runs DHCP only and hands clients `DNS_IP`.
   `tools/diagnose.sh` shows what owns `:53`.
 
+### IPv6 for AP clients
+
+`IPV6_MODE` controls IPv6 on the AP:
+
+- `off` (default) — IPv4 only.
+- `nat66` — clients receive addresses from `AP_PREFIX6` by SLAAC and are
+  NAT66'd to the host's uplink address. Use a ULA (for example
+  `fd42:9977:79:2::/64`) for `AP_PREFIX6`. The host needs a global IPv6
+  address on its uplink (native IPv6, WireGuard, another tunnel).
+- `routed` — clients receive global addresses from `AP_PREFIX6` and are routed
+  without NAT. The upstream must already route the prefix to this host (a VPS
+  `/64`, DHCPv6-PD, ...). Do not also assign the same `/64` to the tunnel
+  interface; give the tunnel a `/128` and route the AP prefix to the host.
+
+Both modes use SLAAC (`ra-stateless` in dnsmasq), because Android does not
+implement DHCPv6. `AP_PREFIX6` must be a `/64`. The AP gateway is `AP_IP6`
+(default: first address, `::1`).
+
+wiplex also enables IPv6 forwarding and installs a TCP MSS clamp for forwarded
+traffic, so a tunnel with a 1420-byte MTU (WireGuard) or smaller works behind
+the 1500-byte AP. If WireGuard is configured with `AllowedIPs = ::/0`, wg-quick
+adds its own clamp; having both is harmless.
+
+Example (NAT66 over a WireGuard uplink that provides global IPv6):
+
+```sh
+IPV6_MODE="nat66"
+AP_IP6="fd42:9977:79:2::1"
+AP_PREFIX6="fd42:9977:79:2::/64"
+```
+
+Check on the host:
+
+```sh
+ip -6 addr show dev wlan0ap
+sysctl net.ipv6.conf.all.forwarding
+nft list table ip6 wiplex       # nat66 only
+```
+
+Check on a client: it should have an address from the prefix and a default
+route learned from RA, and `curl -6 https://ifconfig.co` should work.
+
 ---
 
 ## Operating
@@ -134,7 +180,9 @@ systemctl status wiplex
 journalctl -u wiplex -f            # service log
 tail -f /run/wiplex-hostapd.log    # AP (hostapd)
 tail -f /run/wiplex-dnsmasq.log    # DHCP/DNS (dnsmasq)
-nft list table ip wiplex           # NAT rules
+nft list table ip wiplex           # IPv4 NAT rules
+nft list table ip6 wiplex          # IPv6 NAT66 rules (NAT66 mode)
+nft list table inet wiplex         # forwarded-traffic MSS clamp
 iw dev                             # interfaces
 ```
 
@@ -168,6 +216,13 @@ In `dnsmasq` mode, `:53` must be free on `AP_IP`. If something already owns
 Verify `sysctl net.ipv4.ip_forward` is `1`, that `nft list table ip wiplex`
 shows the masquerade rule, and that `UPSTREAM_IF` matches the real default-route
 interface (`ip route show default`).
+
+**Client gets IPv4 but no IPv6.**
+Set `IPV6_MODE` and check `sysctl net.ipv6.conf.all.forwarding` is `1`,
+`ip -6 addr show dev wlan0ap` has `AP_IP6`, and (in `nat66` mode)
+`nft list table ip6 wiplex` shows the masquerade rule. On the client, check it
+received an address from `AP_PREFIX6` and a default route from RA. For a routed
+prefix, verify the upstream really routes `AP_PREFIX6` to this host.
 
 **Service restart-loops.**
 Run `sudo /usr/local/bin/wiplex` in the foreground to see the error, and check

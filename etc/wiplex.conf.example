@@ -34,12 +34,38 @@ DHCP_END="192.168.50.200"
 DHCP_MASK="255.255.255.0"
 DHCP_LEASE="12h"
 
+# --- IPv6 for AP clients -----------------------------------------------------
+# "off"    : IPv4 only (default).
+# "nat66"  : clients get addresses from AP_PREFIX6 and are NAT66'd out the
+#            uplink. The host needs a global IPv6 address on its uplink
+#            (native IPv6, or a routed tunnel such as WireGuard).
+# "routed" : clients get addresses from AP_PREFIX6 and are routed without NAT.
+#            The uplink must already route AP_PREFIX6 to this host (for
+#            example a /64 from a VPS, or a DHCPv6-PD prefix).
+#
+# AP_PREFIX6 must be a /64: Android and most SLAAC clients require /64.
+# AP_IP6 is the gateway address on the AP; empty = first address (::1).
+#
+# Example (NAT66 with a ULA, like a VPN-routed uplink):
+#   IPV6_MODE="nat66"
+#   AP_IP6="fd42:9977:79:2::1"
+#   AP_PREFIX6="fd42:9977:79:2::/64"
+#
+# Example (routed global /64):
+#   IPV6_MODE="routed"
+#   AP_IP6="2a13:a5c7:3710:abcd::1"
+#   AP_PREFIX6="2a13:a5c7:3710:abcd::/64"
+IPV6_MODE="off"
+AP_IP6=""
+AP_PREFIX6=""
+
 # --- DNS ---------------------------------------------------------------------
 # "dnsmasq"  : wiplex runs a DNS forwarder on AP_IP (self-contained).
 # "external" : DHCP only; clients use DNS_IP (something else already serves
 #              :53, e.g. systemd-resolved/unbound/a proxy).
 DNS_MODE="dnsmasq"
 DNS_IP=""                 # empty = AP_IP
+DNS_IP6=""                # empty = AP_IP6
 DNS_PORT="53"             # dnsmasq DNS port (dnsmasq mode only)
 
 # --- WiFi-share (duplex) behaviour -------------------------------------------
